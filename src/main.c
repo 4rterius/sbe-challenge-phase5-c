@@ -175,9 +175,17 @@ int main(int argc, char *argv[]) {
 
     fprintf(stdout, "Opened input file\n");
 
+    // 0. open a transaction
+
     while ((rc = inputf_read_next(&inputIter)) > 0) {
-        fprintf(stdout, "%s -> %d\n", inputIter.ean13, inputIter.quantity);
+        // 1. try to set product's quantity if it has EAN13:
+        //        UPDATE ps_product SET quantity=%d WHERE ean13=%s;
+        // 2. regardless of the result, get the combination id with EAN13.
+        // 3. if such a combination exists, update its value.
+        // 4. if neither combination not product exis, log a warning.
     }
+
+    // 5. commit the transaction if all good, rollback if not.
 
     if (rc != 0) {
         fprintf(stderr, "Invalid input file at line %d\n", inputIter.line);
