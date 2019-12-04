@@ -4,6 +4,9 @@
 #include <mysql/mysql.h>
 
 
+#define MAX_LINELENGTH 32
+
+
 typedef struct script_params_s {
     char db_name[64];
     char db_user[64];
@@ -43,6 +46,82 @@ int read_config(script_params_t *params, const char *path) {
 }
 
 
+typedef struct inputf_iter_s {
+    unsigned short open;
+    FILE *fp;
+
+    int line;
+    char buf[MAX_LINELENGTH];
+
+    char ean13[14];
+    int quantity;
+} inputf_iter_t;
+
+/**
+ * Initialize an input iterator, opening the given file.
+ * 
+ * @param iter[in,out] An input iterator instance.
+ * @param path[in] Path to input file.
+ * @returns If opened opened successfully, returns file pointer and sets `.open` to 1.
+ *          If failed to open, returns null pointer and sets `.open` to zero.
+ */
+void *inputf_open(inputf_iter_t *iter, const char *path) {
+    iter->fp = fopen(path, "r");
+
+    if (!iter->fp) {
+        iter->open = 0;
+        return NULL;
+    }
+
+    iter->line = 0;
+    iter->open = 1;
+    return iter->fp;
+}
+
+/**
+ * Close the iterator's underlying file pointer if opened and set `.open` to zero.
+ * @param iter[in,out] An input iterator instance.
+ */
+void inputf_close(inputf_iter_t *iter) {
+    if (iter->open == 1)
+        fclose(iter->fp);
+
+    iter->open = 0;
+}
+
+/**
+ * Read next entry of the input file and advance one line down.
+ * 
+ * @param iter[in,out] An input iterator instance.
+ * @returns If read successfully 1, if reached end-of-file 0, on error -1.
+ */
+int inputf_read_next(inputf_iter_t *iter) {
+
+    memset(iter->ean13, 0, 14);
+    memset(iter->buf, 0, MAX_LINELENGTH);
+    iter->line++;
+    iter->quantity = -1;
+
+    int scanRes;
+
+    if (fgets(iter->buf, MAX_LINELENGTH, iter->fp) == NULL) {
+        if (feof(iter->fp))
+            return 0;
+        return -1;
+    }
+
+    scanRes = sscanf(iter->buf, "%13s;%7d", iter->ean13, &iter->quantity);
+
+    if (scanRes == EOF)
+        return 0;
+
+    if (scanRes != 2)
+        return -1;
+
+    return 1;
+}
+
+
 /**
  * Program entry point.
  * Usage: ./my_import_quantities input_file db_config_file
@@ -66,7 +145,7 @@ int main(int argc, char *argv[]) {
         goto error_exit;
     }
 
-    fprintf(stdout, "Config parsed, connecting to '%s' (prefix='%s') as '%s'\n",
+    fprintf(stdout, "Config parsed, connecting to '%s'@'localhost', prefix='%s' as '%s'\n",
         config.db_name, config.table_prefix, config.db_user);
 
 
@@ -83,8 +162,32 @@ int main(int argc, char *argv[]) {
         goto cleanup_error_exit;
     }
 
+    fprintf(stdout, "Connected to the database\n");
 
-    // Cleanup & exit points.
+
+    // Parse the input file
+
+    inputf_iter_t inputIter = {};
+    if (inputf_open(&inputIter, argv[1]) == NULL) {
+        fprintf(stderr, "Failed to open input file '%s'\n", argv[1]);
+        goto cleanup_error_exit;
+    }
+
+    fprintf(stdout, "Opened input file\n");
+
+    while ((rc = inputf_read_next(&inputIter)) > 0) {
+        fprintf(stdout, "%s -> %d\n", inputIter.ean13, inputIter.quantity);
+    }
+
+    if (rc != 0) {
+        fprintf(stderr, "Invalid input file at line %d\n", inputIter.line);
+        inputf_close(&inputIter);
+        goto cleanup_error_exit;
+    }
+
+    // Cleanup & exit points
+    
+    inputf_close(&inputIter);
     goto good_exit;
 
 good_exit:
