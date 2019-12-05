@@ -5,6 +5,7 @@
 
 
 #define MAX_LINELENGTH 32
+#define MAX_QUERYLENGTH 512
 
 
 typedef struct script_params_s {
@@ -175,25 +176,148 @@ int main(int argc, char *argv[]) {
 
     fprintf(stdout, "Opened input file\n");
 
-    // 0. open a transaction
 
-    while ((rc = inputf_read_next(&inputIter)) > 0) {
-        // 1. try to set product's quantity if it has EAN13:
-        //        UPDATE ps_product SET quantity=%d WHERE ean13=%s;
-        // 2. regardless of the result, get the combination id with EAN13.
-        // 3. if such a combination exists, update its value.
-        // 4. if neither combination not product exis, log a warning.
-    }
+    // Start the transaction
 
-    // 5. commit the transaction if all good, rollback if not.
-
-    if (rc != 0) {
-        fprintf(stderr, "Invalid input file at line %d\n", inputIter.line);
+    if (mysql_autocommit(conn, FALSE) != 0) {
+        fprintf(stderr, "Failed to disable autocommit: %s\n", mysql_error(conn));
         inputf_close(&inputIter);
         goto cleanup_error_exit;
     }
 
+
+    // Prepare the statements
+
+    char prefixedSqlProductUpdateQuery[MAX_QUERYLENGTH];
+    char prefixedSqlIdStockAvailableQuery[MAX_QUERYLENGTH];
+
+    if (snprintf(prefixedSqlProductUpdateQuery, MAX_QUERYLENGTH,
+            "UPDATE %sproduct SET quantity=? WHERE ean13=?;", config.table_prefix) < 0) {
+        fprintf(stderr, "Failed to set prefix for product update statement\n");
+        inputf_close(&inputIter);
+        goto cleanup_error_exit;
+    }
+
+    if (snprintf(prefixedSqlIdStockAvailableQuery, MAX_QUERYLENGTH,
+            "SELECT id_stock_available" \
+            " FROM %sproduct_attribute" \
+            " INNER JOIN %sstock_available" \
+            "   ON %sproduct_attribute.id_product=%sstock_available.id_product" \
+            "     AND %sproduct_attribute.id_product_attribute=%sstock_available.id_product_attribute" \
+            " WHERE ean13=?;",
+            config.table_prefix, config.table_prefix, config.table_prefix,
+                config.table_prefix, config.table_prefix, config.table_prefix) < 0) {
+        fprintf(stderr, "Failed to set prefix for `id stock availabile` statement\n");
+        inputf_close(&inputIter);
+        goto cleanup_error_exit;
+    }
+
+    MYSQL_STMT *stmtUpdateProduct = mysql_stmt_init(conn);
+    if (0 != mysql_stmt_prepare(stmtUpdateProduct, 
+                prefixedSqlProductUpdateQuery, strlen(prefixedSqlProductUpdateQuery))) {
+        fprintf(stderr, "Failed to prepare product update statement: %s\n", mysql_stmt_error(stmtUpdateProduct));
+        inputf_close(&inputIter);
+        goto cleanup_error_exit;
+    }
+
+    MYSQL_STMT *stmtIdStockAvailable = mysql_stmt_init(conn);
+    if (0 != mysql_stmt_prepare(stmtIdStockAvailable, 
+                prefixedSqlIdStockAvailableQuery, strlen(prefixedSqlIdStockAvailableQuery))) {
+        fprintf(stderr, "Failed to prepare `id stock availabile` statement: %s\n", mysql_stmt_error(stmtIdStockAvailable));
+        
+        if (mysql_stmt_close(stmtUpdateProduct) != 0)
+            fprintf(stderr, "Failed to close prepared product update statement: %s\n", mysql_error(conn));
+        
+        inputf_close(&inputIter);
+        goto cleanup_error_exit;
+    }
+
+    int loopProductQuantity = -1;
+    char loopEan13[14];
+
+    MYSQL_BIND bindUpdateProduct[2];
+    memset(bindUpdateProduct, 0, sizeof(bindUpdateProduct));
+    bindUpdateProduct[0].buffer_type = MYSQL_TYPE_LONG;
+    bindUpdateProduct[0].buffer = (int *)&loopProductQuantity;
+    bindUpdateProduct[0].length = 0;
+    bindUpdateProduct[1].buffer_type = MYSQL_TYPE_STRING;
+    bindUpdateProduct[1].buffer = &loopEan13;
+    long unsigned int loopEan13Length = 14;
+    bindUpdateProduct[1].buffer_length = loopEan13Length;
+    bindUpdateProduct[1].length = &loopEan13Length;
+
+    if (0 != mysql_stmt_bind_param(stmtUpdateProduct, bindUpdateProduct)) {
+        fprintf(stderr, "Failed to bind params for the product update statement: %s\n", mysql_stmt_error(stmtUpdateProduct));
+
+        if (mysql_stmt_close(stmtUpdateProduct) != 0)
+            fprintf(stderr, "Failed to close prepared product update statement: %s\n", mysql_error(conn));
+
+        if (mysql_stmt_close(stmtIdStockAvailable) != 0)
+            fprintf(stderr, "Failed to close `id stock availabile` update statement: %s\n", mysql_error(conn));
+
+        inputf_close(&inputIter);
+        goto cleanup_error_exit;
+    }
+
+    while ((rc = inputf_read_next(&inputIter)) > 0) {
+        // 2. regardless of the result, get the combination id with EAN13.
+        // 3. if such a combination exists, update its value.
+        // 4. if neither combination not product exis, log a warning.
+
+
+        // 1. try to set product's quantity if it has EAN13
+
+        long affected_rows = 0;
+        long affected_rows_step1 = 0;
+
+        loopProductQuantity = inputIter.quantity;
+        strncpy(loopEan13, inputIter.ean13, 13);
+
+        if (0 != mysql_stmt_execute(stmtUpdateProduct)) {
+            fprintf(stderr, "Failed to update a product with EAN13=%s (line %d)\n", inputIter.ean13, inputIter.line);
+        }
+        
+        if ((affected_rows_step1 = (long)mysql_stmt_affected_rows(stmtUpdateProduct)) > 0)
+            affected_rows += affected_rows_step1;
+        
+    }
+
+    if (rc != 0) {
+        fprintf(stderr, "Invalid input file at line %d, rolling back\n", inputIter.line);
+
+        if (mysql_rollback(conn) != 0)
+            fprintf(stderr, "Failed to roll back the transaction: %s\n", mysql_error(conn));
+        
+        if (mysql_stmt_close(stmtUpdateProduct) != 0)
+            fprintf(stderr, "Failed to close prepared product update statement: %s\n", mysql_error(conn));
+
+        if (mysql_stmt_close(stmtIdStockAvailable) != 0)
+            fprintf(stderr, "Failed to close prepared `id stock availabile` statement: %s\n", mysql_error(conn));
+
+        inputf_close(&inputIter);
+        goto cleanup_error_exit;
+    }
+
+
+    // Commit the transaction
+
+    if (mysql_commit(conn) != 0)
+        fprintf(stderr, "Failed to commit the transaction: %s\n", mysql_error(conn));
+    else
+        fprintf(stdout, "Committed the transaction\n");
+
+
     // Cleanup & exit points
+    
+    goto cleanup;
+
+cleanup:
+    if (mysql_stmt_close(stmtUpdateProduct) != 0 ||
+            mysql_stmt_close(stmtUpdateProduct) != 0) {
+        fprintf(stderr, "Failed to close prepared one or more prepared statements: %s\n", mysql_error(conn));
+        inputf_close(&inputIter);
+        goto cleanup_error_exit;
+    }
     
     inputf_close(&inputIter);
     goto good_exit;
